@@ -1,0 +1,447 @@
+// SPDX-License-Identifier: ISC
+/*
+ * MT7915/MT7916 virtual PTP Hardware Clock on top of the 802.11 TSF.
+ *
+ * Ported from the ath9k PHC reference (cyclecounter/timecounter model):
+ *   - gettime  : latch + read 64-bit TSF, convert with (mult, offset)
+ *   - adjtime  : offset += delta
+ *   - adjfreq  : re-anchor at current TSF, mult = nominal +/- nominal*ppb/1e9
+ *   - adjfine  : same, scaled_ppm (kernels >= 4.10; adjfreq is gone in 6.2)
+ *   - settime  : re-anchor at current TSF, offset = new time
+ *
+ * Locking:
+ *   - dev->mt76.mutex serialises the TSF latch/read sequence against
+ *     mac80211's get_tsf/set_tsf/offset_tsf, which use the same LPON TCR
+ *     latch under that mutex. Only taken from PHC ops / workqueue, which
+ *     run in process context and may sleep.
+ *   - ptp->lock (spin_lock_irqsave) protects mult/offset/tsf_base/last_tsf.
+ *     Held only for arithmetic, never across MMIO, so the RX/TX hot-path
+ *     helpers can use it from any context.
+ */
+
+#include <linux/version.h>
+#include <linux/ktime.h>
+#include <linux/timekeeping.h>
+#include <linux/math64.h>
+#include <linux/ptp_clock_kernel.h>
+
+#include "mt7915.h"
+#include "ptp.h"
+
+#if IS_REACHABLE(CONFIG_PTP_1588_CLOCK)
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+#define MT7915_PTP_HAS_GETTIMEX64	1
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
+#define MT7915_PTP_HAS_ADJFINE		1
+#endif
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 2, 0)
+#define MT7915_PTP_HAS_ADJFREQ		1
+#endif
+
+#ifndef MT7915_PTP_HAS_GETTIMEX64
+struct ptp_system_timestamp;
+static inline void ptp_read_system_prets(struct ptp_system_timestamp *sts) { }
+static inline void ptp_read_system_postts(struct ptp_system_timestamp *sts) { }
+#endif
+
+#define MT7915_PTP_TSF_READ_RETRIES	3
+
+static inline struct mt7915_ptp *to_mt7915_ptp(struct ptp_clock_info *info)
+{
+	return container_of(info, struct mt7915_ptp, info);
+}
+
+static inline struct mt7915_dev *mt7915_ptp_to_dev(struct mt7915_ptp *ptp)
+{
+	return container_of(ptp, struct mt7915_dev, ptp);
+}
+
+static u32 mt7915_ptp_tcr_reg(struct mt7915_dev *dev)
+{
+	struct mt7915_ptp *ptp = &dev->ptp;
+
+	if (is_mt7915(&dev->mt76))
+		return MT_LPON_TCR(ptp->band, ptp->tsf_idx);
+
+	return MT_LPON_TCR_MT7916(ptp->band, ptp->tsf_idx);
+}
+
+/*
+ * Latch and read the 64-bit TSF.
+ *
+ * Writing SW_READ into the LPON TCR mode field snapshots the selected TSF
+ * into UTTR0 (low) / UTTR1 (high) atomically, so the two 32-bit reads are
+ * consistent with each other. UTTR0 is read a second time to detect a
+ * re-latch by anyone else between our two reads (e.g. firmware), in which
+ * case we retry.
+ *
+ * mt76_rr()/mt76_wr() go through readl()/writel(), which already convert
+ * from the device's little-endian MMIO to CPU order on both mipsel and
+ * mips (BE). No le32_to_cpu() here; applying one would double-swap on BE.
+ * The 64-bit value is composed arithmetically (not via a u32[2] union, as
+ * mt7915_get_tsf() does), so it is correct on either endianness.
+ *
+ * The system timestamp window brackets the latch write and the first UTTR0
+ * read: the read is non-posted and ordered behind the posted write, so the
+ * latch is guaranteed to have happened inside [prets, postts].
+ */
+static int mt7915_ptp_read_tsf(struct mt7915_dev *dev, u64 *tsf,
+			       struct ptp_system_timestamp *sts)
+{
+	struct mt7915_ptp *ptp = &dev->ptp;
+	u32 tcr_reg = mt7915_ptp_tcr_reg(dev);
+	u32 tcr, lo, hi, lo2;
+	int i;
+
+	lockdep_assert_held(&dev->mt76.mutex);
+
+	if (test_bit(MT76_RESET, &dev->mphy.state))
+		return -EBUSY;
+
+	tcr = mt76_rr(dev, tcr_reg);
+	tcr &= ~MT_LPON_TCR_SW_MODE;
+	tcr |= MT_LPON_TCR_SW_READ;
+
+	for (i = 0; i < MT7915_PTP_TSF_READ_RETRIES; i++) {
+		ptp_read_system_prets(sts);
+		mt76_wr(dev, tcr_reg, tcr);
+		lo = mt76_rr(dev, MT_LPON_UTTR0(ptp->band));
+		ptp_read_system_postts(sts);
+
+		hi = mt76_rr(dev, MT_LPON_UTTR1(ptp->band));
+		lo2 = mt76_rr(dev, MT_LPON_UTTR0(ptp->band));
+
+		if (likely(lo == lo2)) {
+			*tsf = ((u64)hi << 32) | lo;
+			return 0;
+		}
+	}
+
+	dev_warn_ratelimited(dev->mt76.dev,
+			     "ptp: inconsistent TSF read (%08x/%08x)\n",
+			     lo, lo2);
+	return -EIO;
+}
+
+static int mt7915_ptp_read_tsf_locked(struct mt7915_dev *dev, u64 *tsf,
+				      struct ptp_system_timestamp *sts)
+{
+	int ret;
+
+	mutex_lock(&dev->mt76.mutex);
+	ret = mt7915_ptp_read_tsf(dev, tsf, sts);
+	mutex_unlock(&dev->mt76.mutex);
+
+	return ret;
+}
+
+/* Caller holds ptp->lock. Moves the anchor to @tsf without changing time. */
+static void __mt7915_ptp_reanchor(struct mt7915_ptp *ptp, u64 tsf)
+{
+	ptp->offset = __mt7915_ptp_tsf_to_ns(ptp, tsf);
+	ptp->tsf_base = tsf;
+}
+
+/*
+ * Apply a frequency correction. @neg/@diff is the change to the nominal
+ * mult. Re-anchor at the current TSF first so that past time is preserved
+ * (same role as timecounter_read() in ath9k_phc_adjfreq()).
+ */
+static int mt7915_ptp_set_mult(struct mt7915_ptp *ptp, bool neg, u64 diff)
+{
+	struct mt7915_dev *dev = mt7915_ptp_to_dev(ptp);
+	unsigned long flags;
+	u32 new_mult;
+	u64 tsf;
+	int ret;
+
+	if (diff >= ptp->nominal_mult ||
+	    (!neg && diff > U32_MAX - ptp->nominal_mult))
+		return -ERANGE;
+
+	new_mult = neg ? ptp->nominal_mult - (u32)diff :
+			 ptp->nominal_mult + (u32)diff;
+
+	ret = mt7915_ptp_read_tsf_locked(dev, &tsf, NULL);
+	if (ret)
+		return ret;
+
+	spin_lock_irqsave(&ptp->lock, flags);
+	ptp->last_tsf = tsf;
+	__mt7915_ptp_reanchor(ptp, tsf);
+	ptp->mult = new_mult;
+	spin_unlock_irqrestore(&ptp->lock, flags);
+
+	return 0;
+}
+
+#ifdef MT7915_PTP_HAS_ADJFREQ
+/* Reference formula: diff = mult * ppb / 1e9 (against the nominal mult). */
+static int mt7915_ptp_adjfreq(struct ptp_clock_info *info, s32 ppb)
+{
+	struct mt7915_ptp *ptp = to_mt7915_ptp(info);
+	bool neg = ppb < 0;
+	u64 diff;
+
+	if (neg)
+		ppb = -ppb;
+
+	diff = div_u64((u64)ptp->nominal_mult * (u32)ppb, NSEC_PER_SEC);
+
+	return mt7915_ptp_set_mult(ptp, neg, diff);
+}
+#endif
+
+#ifdef MT7915_PTP_HAS_ADJFINE
+/*
+ * scaled_ppm is ppm with a 16-bit binary fraction:
+ * diff = mult * scaled_ppm / (1e6 * 2^16). Finer than adjfreq's 1 ppb.
+ */
+static int mt7915_ptp_adjfine(struct ptp_clock_info *info, long scaled_ppm)
+{
+	struct mt7915_ptp *ptp = to_mt7915_ptp(info);
+	bool neg = scaled_ppm < 0;
+	u64 diff;
+
+	if (neg)
+		scaled_ppm = -scaled_ppm;
+
+	diff = div64_u64((u64)ptp->nominal_mult * (u64)scaled_ppm,
+			 1000000ULL << 16);
+
+	return mt7915_ptp_set_mult(ptp, neg, diff);
+}
+#endif
+
+static int mt7915_ptp_adjtime(struct ptp_clock_info *info, s64 delta)
+{
+	struct mt7915_ptp *ptp = to_mt7915_ptp(info);
+	unsigned long flags;
+
+	spin_lock_irqsave(&ptp->lock, flags);
+	ptp->offset += delta;
+	spin_unlock_irqrestore(&ptp->lock, flags);
+
+	return 0;
+}
+
+static int mt7915_ptp_gettime_sts(struct mt7915_ptp *ptp,
+				  struct timespec64 *ts,
+				  struct ptp_system_timestamp *sts)
+{
+	struct mt7915_dev *dev = mt7915_ptp_to_dev(ptp);
+	unsigned long flags;
+	u64 tsf, ns;
+	int ret;
+
+	ret = mt7915_ptp_read_tsf_locked(dev, &tsf, sts);
+	if (ret)
+		return ret;
+
+	spin_lock_irqsave(&ptp->lock, flags);
+	ptp->last_tsf = tsf;
+	ns = __mt7915_ptp_tsf_to_ns(ptp, tsf);
+	spin_unlock_irqrestore(&ptp->lock, flags);
+
+	*ts = ns_to_timespec64(ns);
+
+	return 0;
+}
+
+#ifdef MT7915_PTP_HAS_GETTIMEX64
+static int mt7915_ptp_gettimex64(struct ptp_clock_info *info,
+				 struct timespec64 *ts,
+				 struct ptp_system_timestamp *sts)
+{
+	return mt7915_ptp_gettime_sts(to_mt7915_ptp(info), ts, sts);
+}
+#endif
+
+static int mt7915_ptp_gettime64(struct ptp_clock_info *info,
+				struct timespec64 *ts)
+{
+	return mt7915_ptp_gettime_sts(to_mt7915_ptp(info), ts, NULL);
+}
+
+static int mt7915_ptp_settime64(struct ptp_clock_info *info,
+				const struct timespec64 *ts)
+{
+	struct mt7915_ptp *ptp = to_mt7915_ptp(info);
+	struct mt7915_dev *dev = mt7915_ptp_to_dev(ptp);
+	unsigned long flags;
+	u64 tsf;
+	int ret;
+
+	ret = mt7915_ptp_read_tsf_locked(dev, &tsf, NULL);
+	if (ret)
+		return ret;
+
+	spin_lock_irqsave(&ptp->lock, flags);
+	ptp->last_tsf = tsf;
+	ptp->tsf_base = tsf;
+	ptp->offset = timespec64_to_ns(ts);
+	spin_unlock_irqrestore(&ptp->lock, flags);
+
+	return 0;
+}
+
+static int mt7915_ptp_enable(struct ptp_clock_info *info,
+			     struct ptp_clock_request *rq, int on)
+{
+	return -EOPNOTSUPP;
+}
+
+static const struct ptp_clock_info mt7915_ptp_clock_info = {
+	.owner		= THIS_MODULE,
+	.name		= "mt7915",
+	.max_adj	= MT7915_PTP_MAX_ADJ,
+	.n_alarm	= 0,
+	.n_ext_ts	= 0,
+	.n_per_out	= 0,
+	.n_pins		= 0,
+	.pps		= 0,
+#ifdef MT7915_PTP_HAS_ADJFINE
+	.adjfine	= mt7915_ptp_adjfine,
+#endif
+#ifdef MT7915_PTP_HAS_ADJFREQ
+	.adjfreq	= mt7915_ptp_adjfreq,
+#endif
+	.adjtime	= mt7915_ptp_adjtime,
+	.gettime64	= mt7915_ptp_gettime64,
+#ifdef MT7915_PTP_HAS_GETTIMEX64
+	.gettimex64	= mt7915_ptp_gettimex64,
+#endif
+	.settime64	= mt7915_ptp_settime64,
+	.enable		= mt7915_ptp_enable,
+};
+
+/*
+ * Keep last_tsf fresh so that 32-bit descriptor timestamps can be extended
+ * to 64 bits in the hot path without touching MMIO.
+ */
+static void mt7915_ptp_resync_work(struct work_struct *work)
+{
+	struct mt7915_ptp *ptp = container_of(to_delayed_work(work),
+					      struct mt7915_ptp, resync_work);
+	struct mt7915_dev *dev = mt7915_ptp_to_dev(ptp);
+	unsigned long flags;
+	u64 tsf;
+
+	if (!mt7915_ptp_read_tsf_locked(dev, &tsf, NULL)) {
+		spin_lock_irqsave(&ptp->lock, flags);
+		ptp->last_tsf = tsf;
+		spin_unlock_irqrestore(&ptp->lock, flags);
+	}
+
+	schedule_delayed_work(&ptp->resync_work, MT7915_PTP_RESYNC_INTERVAL);
+}
+
+u64 mt7915_ptp_tsf_to_phc_time(struct mt7915_dev *dev, u64 tsf)
+{
+	struct mt7915_ptp *ptp = &dev->ptp;
+	unsigned long flags;
+	u64 ns;
+
+	spin_lock_irqsave(&ptp->lock, flags);
+	ns = __mt7915_ptp_tsf_to_ns(ptp, tsf);
+	spin_unlock_irqrestore(&ptp->lock, flags);
+
+	return ns;
+}
+
+u64 mt7915_ptp_tsf32_to_phc_time(struct mt7915_dev *dev, u32 tsf_lo)
+{
+	struct mt7915_ptp *ptp = &dev->ptp;
+	unsigned long flags;
+	u64 ns;
+
+	spin_lock_irqsave(&ptp->lock, flags);
+	ns = __mt7915_ptp_tsf_to_ns(ptp,
+				    __mt7915_ptp_tsf32_extend(ptp->last_tsf,
+							      tsf_lo));
+	spin_unlock_irqrestore(&ptp->lock, flags);
+
+	return ns;
+}
+
+int mt7915_ptp_index(struct mt7915_dev *dev)
+{
+	return dev->ptp.clock ? ptp_clock_index(dev->ptp.clock) : -1;
+}
+
+/*
+ * Call after mt7915_init_hardware() (MCU up, EEPROM MAC known) and BEFORE
+ * mt76_register_device(), so the spinlock and the conversion anchor are
+ * valid before any netdev can be brought up and hit the RX/TX hot path.
+ * Failure is non-fatal for the WLAN driver. Process context; may sleep.
+ */
+int mt7915_ptp_init(struct mt7915_dev *dev)
+{
+	struct mt7915_ptp *ptp = &dev->ptp;
+	struct ptp_clock *clock;
+	u64 tsf = 0;
+	int ret;
+
+	spin_lock_init(&ptp->lock);
+	INIT_DELAYED_WORK(&ptp->resync_work, mt7915_ptp_resync_work);
+
+	ptp->clock = NULL;
+	ptp->band = dev->phy.mt76->band_idx;
+	ptp->tsf_idx = HW_BSSID_0;
+	ptp->nominal_mult = MT7915_PTP_NOMINAL_MULT;
+	ptp->mult = ptp->nominal_mult;
+
+	ptp->info = mt7915_ptp_clock_info;
+	snprintf(ptp->info.name, sizeof(ptp->info.name), "%pm",
+		 dev->mphy.macaddr);
+
+	ret = mt7915_ptp_read_tsf_locked(dev, &tsf, NULL);
+	if (ret)
+		dev_warn(dev->mt76.dev,
+			 "ptp: initial TSF read failed (%d), anchoring at 0\n",
+			 ret);
+
+	ptp->tsf_base = tsf;
+	ptp->last_tsf = tsf;
+	ptp->offset = ktime_get_real_ns();
+
+	clock = ptp_clock_register(&ptp->info, dev->mt76.dev);
+	if (IS_ERR(clock)) {
+		ret = PTR_ERR(clock);
+		dev_err(dev->mt76.dev, "ptp: ptp_clock_register failed (%d)\n",
+			ret);
+		return ret;
+	}
+	if (!clock)	/* PTP core compiled out */
+		return 0;
+
+	ptp->clock = clock;
+	schedule_delayed_work(&ptp->resync_work, MT7915_PTP_RESYNC_INTERVAL);
+
+	dev_info(dev->mt76.dev, "ptp: registered PHC /dev/ptp%d (band %u)\n",
+		 ptp_clock_index(clock), ptp->band);
+
+	return 0;
+}
+
+/* Process context; may sleep. Must not be called with mt76.mutex held. */
+void mt7915_ptp_cleanup(struct mt7915_dev *dev)
+{
+	struct mt7915_ptp *ptp = &dev->ptp;
+
+	if (!ptp->clock)
+		return;
+
+	/* Waits for in-flight PHC ops; no new ones after this returns. */
+	ptp_clock_unregister(ptp->clock);
+	ptp->clock = NULL;
+
+	/* Handles the self-rearming work. */
+	cancel_delayed_work_sync(&ptp->resync_work);
+
+	dev_info(dev->mt76.dev, "ptp: removed PHC\n");
+}
+
+#endif /* IS_REACHABLE(CONFIG_PTP_1588_CLOCK) */
